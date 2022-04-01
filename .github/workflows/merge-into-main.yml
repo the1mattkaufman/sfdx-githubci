@@ -63,7 +63,7 @@ jobs:
 
       # Set config username for CLI Commands
       - name: "Set config username for CLI commands"
-        run: sfdx config:set defaultusername=${{secrets.PRODD_SFDX_USER}} defaultdevhubusername=${{secrets.PRODD_SFDX_USER}}
+        run: sfdx config:set defaultusername=${{secrets.PROD_SFDX_USER}} defaultdevhubusername=${{secrets.PROD_SFDX_USER}}
 
       # Create/deploy release artifact to production org
 
