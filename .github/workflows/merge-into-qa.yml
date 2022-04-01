@@ -1,0 +1,142 @@
+#Push to qa
+#Your pull request to merge with qa has passed tests and manual code review
+
+#Deploys source code to qa org on pull request approval
+#Opens a pull request to merge the same changes with the staging branch
+
+#Previous step: pr-dev-to-qa
+#Next step: pr-qa-to-staging
+
+#IMPORTANT:
+#Unit tests are ran during the pull request from dev to qa and the push to qa org processes
+#This is done in the event that a dev/feature branch gets stalled on a pull request and a separate pull request gets approved and pushed to qa, rendering the other branch's tests meaningless.
+
+# Unique name for this workflow
+name: Push/Org Deploy - qa
+
+#Pull request closed merge=true allows access to the ref branch while push does not
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - "qa"
+      - "QA"
+
+# Jobs to be executed
+jobs:
+  qa-org-test-and-deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the code in the pull request
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # Install Salesforce CLI
+      - name: Install Salesforce CLI
+        run: |
+          wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+          sudo mkdir ~/sfdx-cli
+          sudo tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx-cli --strip-components 1
+          export PATH=$PATH:~/sfdx-cli/bin
+          echo "~/sfdx-cli/bin" >> $GITHUB_PATH
+          sudo chmod -R 777 ~/sfdx-cli
+          sfdx --version
+
+      # Store secret for dev hub org
+      - name: "Populate auth file with QA_SFDX_URL secret"
+        run: "echo ${{secrets.QA_SFDX_URL}} > ./QA_SFDX_URL.txt"
+
+      # Authenticate dev hub
+      # Authorizes org using SFDX auth url stored in a file
+      - name: "Authenticate Dev Hub"
+        run: sfdx auth:sfdxurl:store -f ./QA_SFDX_URL.txt -a devhub -d
+
+      # Remove auth file
+      - name: "Remove auth file"
+        run: rm -f ./QA_SFDX_URL.txt
+
+      # Set config username for CLI Commands
+      - name: "Set config username for CLI commands"
+        run: sfdx config:set defaultusername=${{secrets.QA_SFDX_USER}} defaultdevhubusername=${{secrets.QA_SFDX_USER}}
+
+      # Store branch ids
+      - name: Get branch refs
+        run: |
+          echo "HEAD_REF=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+          echo "BASE_REF=$(echo ${GITHUB_BASE_REF} | tr / -)" >> $GITHUB_ENV
+
+      # Install SFDX & SFDX Git Delta
+      # Since qa was just merged with the feature branch, we have to reference qa's previous commit for the diff (origin/${{ env.BASE_REF }}^ = qa^)
+      - name: Install SFDX Git Delta
+        run: |
+          echo y | ~/sfdx-cli/bin/run plugins:install sfdx-git-delta
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --all
+          git --no-pager diff --name-status origin/main origin/${{ env.HEAD_REF }}
+
+      # Convert source code to metadata
+      - name: Convert source code to metadata format
+        run: sfdx force:source:convert --rootdir force-app --outputdir source_convert
+
+      # Generate manifest from delta (git diff between head and main)
+      - name: Generate destructive changes metadeta
+        run: |
+          sfdx sgd:source:delta --to origin/${{ env.HEAD_REF }} --from origin/main --output .
+          echo
+          echo "--- package.xml generated with added and modified metadata ---"
+          cat package/package.xml
+          echo
+          echo
+          echo
+          echo "-- destructiveChanges.xml ---"
+          cat destructiveChanges/destructiveChanges.xml
+          echo
+          echo
+          echo
+          echo "--- destructiveChanges/package.xml ---"
+          cat destructiveChanges/package.xml
+
+      # Copy changes to release artifact
+      - name: Append destructive changes to source metadata
+        run: cp destructiveChanges/destructiveChanges.xml source_convert
+
+      # Create release artifact
+      - name: Create release artifact
+        run: zip -r package.zip source_convert
+
+      - name: Remove source convert output directory
+        run: rm -r source_convert
+
+      # Validate and deploy
+      - name: Deploy artifact to qa org
+        run: sfdx force:mdapi:deploy --zipfile package.zip --testlevel RunAllTestsInOrg -w 10
+
+      # Open pull request to merge feature with staging branch
+      - name: "Checkout dev pull request code"
+        uses: actions/checkout@v2
+        with:
+          ref: staging
+
+      - name: "Reset dev/feature branch"
+        run: |
+          git fetch origin ${{ env.HEAD_REF }}:${{ env.HEAD_REF }}
+          git reset --hard ${{ env.HEAD_REF }}
+
+      - name: Create pull request to merge with staging
+        uses: peter-evans/create-pull-request@v3
+        with:
+          token: ${{ secrets.REPO_SCOPED_TOKEN }}
+          branch: staging-merge-request-from-${{ env.HEAD_REF }}
+          title: Merge request into staging from dev branch - ${{ env.HEAD_REF }}
+          body: Feature from branch ${{ env.HEAD_REF }} has been tested in the qa branch, deployed to the qa org, and approved to move up to staging.
+
+      # Delete feature branch as we are done with it
+      - name: Branch Delete - ${{ env.HEAD_REF }}
+        uses: dawidd6/action-delete-branch@v3
+        with:
+          github_token: ${{ secrets.REPO_SCOPED_TOKEN }}
+          branches: ${{ env.HEAD_REF }}
