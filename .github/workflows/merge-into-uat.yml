@@ -12,7 +12,7 @@
 #This is done in the event that a dev/feature branch gets stalled on a pull request and a separate pull request gets approved and pushed to UAT, rendering the other branch's tests meaningless.
 
 # Unique name for this workflow
-name: Merge Into UAT
+name: Push/Org Deploy - uat
 
 #Pull request closed merge=true allows access to the ref branch while push does not
 on:
@@ -21,6 +21,7 @@ on:
       - closed
     branches:
       - "uat"
+      - "UAT"
 
 # Jobs to be executed
 jobs:
@@ -28,50 +29,93 @@ jobs:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
+      # Checkout the code in the pull request
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
       # Install Salesforce CLI
       - name: Install Salesforce CLI
         run: |
-          wget https://developer.salesforce.com/media/salesforce-cli/sfdx-linux-amd64.tar.xz
-          mkdir sfdx-cli
-          tar xJf sfdx-linux-amd64.tar.xz -C sfdx-cli --strip-components 1
-          ./sfdx-cli/install
-
-      # Checkout the code in the pull request
-      - name: "Checkout source code"
-        uses: actions/checkout@v2
-
-      # TESTING
-      - name: "Echo Commit Ids"
-        run: |
-          echo head ref - ${GITHUB_HEAD_REF}
-          echo base ref - ${GITHUB_BASE_REF}
-
-      - name: Get branch name (pull request)
-        run: echo "BRANCH_NAME=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+          wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+          sudo mkdir ~/sfdx-cli
+          sudo tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx-cli --strip-components 1
+          export PATH=$PATH:~/sfdx-cli/bin
+          echo "~/sfdx-cli/bin" >> $GITHUB_PATH
+          sudo chmod -R 777 ~/sfdx-cli
+          sfdx --version
 
       # Store secret for dev hub org
-      - name: "Populate auth file with UAT_SFDX_URL secret"
-        shell: bash
-        run: "echo ${{secrets.UAT_SFDX_URL}} > ./UAT_SFDX_URL.txt"
+      - name: "Populate auth file with DEVHUB_SFDX_URL_UAT secret"
+        run: "echo ${{secrets.DEVHUB_SFDX_URL_UAT}} > ./DEVHUB_SFDX_URL_UAT.txt"
 
       # Authenticate dev hub
       # Authorizes org using SFDX auth url stored in a file
       - name: "Authenticate Dev Hub"
-        run: "sfdx force:auth:sfdxurl:store -f ./UAT_SFDX_URL.txt -a devhub -d"
+        run: sfdx auth:sfdxurl:store -f ./DEVHUB_SFDX_URL_UAT.txt -a devhub -d
 
       # Remove auth file
       - name: "Remove auth file"
-        run: rm -f ./UAT_SFDX_URL.txt
+        run: rm -f ./DEVHUB_SFDX_URL_UAT.txt
 
       # Set config username for CLI Commands
       - name: "Set config username for CLI commands"
-        run: sfdx config:set defaultusername=${{secrets.UAT_USERNAME}} defaultdevhubusername=${{secrets.UAT_USERNAME}}
+        run: sfdx config:set defaultusername=${{secrets.DEVHUB_SFDX_USER_UAT}} defaultdevhubusername=${{secrets.DEVHUB_SFDX_USER_UAT}}
 
-      # Deploy source code to UAT org
-      - name: "Deploy source code to uat org"
-        run: sfdx force:source:deploy -x ./manifest/package.xml -l RunAllTestsInOrg --verbose
+      # Store branch ids
+      - name: Get branch refs
+        run: |
+          echo "HEAD_REF=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+          echo "BASE_REF=$(echo ${GITHUB_BASE_REF} | tr / -)" >> $GITHUB_ENV
 
-        #Open pull request to merge feature with staging branch
+      # Install SFDX & SFDX Git Delta
+      # Since uat was just merged with the feature branch, we have to reference uat's previous commit for the diff (origin/${{ env.BASE_REF }}^ = uat^)
+      - name: Install SFDX Git Delta
+        run: |
+          echo y | ~/sfdx-cli/bin/run plugins:install sfdx-git-delta
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --all
+          git --no-pager diff --name-status origin/main origin/${{ env.HEAD_REF }}
+
+      # Convert source code to metadata
+      - name: Convert source code to metadata format
+        run: sfdx force:source:convert --rootdir force-app --outputdir source_convert
+
+      # Generate manifest from delta (git diff between head and main)
+      - name: Generate destructive changes metadeta
+        run: |
+          sfdx sgd:source:delta --to origin/${{ env.HEAD_REF }} --from origin/main --output .
+          echo
+          echo "--- package.xml generated with added and modified metadata ---"
+          cat package/package.xml
+          echo
+          echo
+          echo
+          echo "-- destructiveChanges.xml ---"
+          cat destructiveChanges/destructiveChanges.xml
+          echo
+          echo
+          echo
+          echo "--- destructiveChanges/package.xml ---"
+          cat destructiveChanges/package.xml
+
+      # Copy changes to release artifact
+      - name: Append destructive changes to source metadata
+        run: cp destructiveChanges/destructiveChanges.xml source_convert
+
+      # Create release artifact
+      - name: Create release artifact
+        run: zip -r package.zip source_convert
+
+      - name: Remove source convert output directory
+        run: rm -r source_convert
+
+      # Validate and deploy
+      - name: Deploy artifact to uat org
+        run: sfdx force:mdapi:deploy --zipfile package.zip --testlevel RunAllTestsInOrg -w 10
+
+      # Open pull request to merge feature with staging branch
       - name: "Checkout dev pull request code"
         uses: actions/checkout@v2
         with:
@@ -79,13 +123,20 @@ jobs:
 
       - name: "Reset dev/feature branch"
         run: |
-          git fetch origin ${{ env.BRANCH_NAME }}:${{ env.BRANCH_NAME }}
-          git reset --hard ${{ env.BRANCH_NAME }}
+          git fetch origin ${{ env.HEAD_REF }}:${{ env.HEAD_REF }}
+          git reset --hard ${{ env.HEAD_REF }}
 
       - name: Create pull request to merge with staging
         uses: peter-evans/create-pull-request@v3
         with:
           token: ${{ secrets.REPO_SCOPED_TOKEN }}
-          branch: staging-merge-from-dev_branch_${{ env.BRANCH_NAME }}
-          title: Merge/deploy request into staging from dev branch - ${{ env.BRANCH_NAME }}
-          body: A feature tested in the uat branch has been deployed to the uat org and approved to move up to staging.
+          branch: staging-merge-request-from-${{ env.HEAD_REF }}
+          title: Merge request into staging from dev branch - ${{ env.HEAD_REF }}
+          body: Feature from branch ${{ env.HEAD_REF }} has been tested in the uat branch, deployed to the uat org, and approved to move up to staging.
+
+      # Delete feature branch as we are done with it
+      - name: Branch Delete - ${{ env.HEAD_REF }}
+        uses: dawidd6/action-delete-branch@v3
+        with:
+          github_token: ${{ secrets.REPO_SCOPED_TOKEN }}
+          branches: ${{ env.HEAD_REF }}

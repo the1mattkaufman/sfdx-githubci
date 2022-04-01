@@ -8,7 +8,7 @@
 #Next step: none
 
 # Unique name for this workflow
-name: Push to main
+name: Push/Org Deploy - main
 
 #Pull request closed merge=true allows access to the ref branch while push does not
 on:
@@ -17,6 +17,13 @@ on:
       - closed
     branches:
       - "main"
+      - "Main"
+      - "master"
+      - "Master"
+      - "prod"
+      - "Prod"
+      - "production"
+      - "Production"
 
 # Jobs to be executed
 jobs:
@@ -24,50 +31,91 @@ jobs:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
+      # Checkout the code in the pull request
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
       # Install Salesforce CLI
       - name: Install Salesforce CLI
         run: |
-          wget https://developer.salesforce.com/media/salesforce-cli/sfdx-linux-amd64.tar.xz
-          mkdir sfdx-cli
-          tar xJf sfdx-linux-amd64.tar.xz -C sfdx-cli --strip-components 1
-          ./sfdx-cli/install
-
-      # Checkout the code in the pull request
-      - name: "Checkout source code"
-        uses: actions/checkout@v2
-
-      # TESTING
-      - name: "Echo Commit Ids"
-        run: |
-          echo head ref - ${GITHUB_HEAD_REF}
-          echo base ref - ${GITHUB_BASE_REF}
-
-      - name: Get branch name (pull request)
-        run: echo "BRANCH_NAME=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+          wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+          sudo mkdir ~/sfdx-cli
+          sudo tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx-cli --strip-components 1
+          export PATH=$PATH:~/sfdx-cli/bin
+          echo "~/sfdx-cli/bin" >> $GITHUB_PATH
+          sudo chmod -R 777 ~/sfdx-cli
+          sfdx --version
 
       # Store secret for dev hub org
-      - name: "Populate auth file with PRODUCTION_SFDX_URL secret"
-        shell: bash
-        run: "echo ${{secrets.PRODUCTION_SFDX_URL}} > ./PRODUCTION_SFDX_URL.txt"
+      - name: "Populate auth file with PROD_SFDX_URL secret"
+        run: "echo ${{secrets.PROD_SFDX_URL}} > ./PROD_SFDX_URL.txt"
 
       # Authenticate dev hub
       # Authorizes org using SFDX auth url stored in a file
       - name: "Authenticate Dev Hub"
-        run: "sfdx force:auth:sfdxurl:store -f ./PRODUCTION_SFDX_URL.txt -a devhub -d"
+        run: sfdx auth:sfdxurl:store -f ./PROD_SFDX_URL.txt -a devhub -d
 
       # Remove auth file
       - name: "Remove auth file"
-        run: rm -f ./PRODUCTION_SFDX_URL.txt
+        run: rm -f ./PROD_SFDX_URL.txt
 
       # Set config username for CLI Commands
       - name: "Set config username for CLI commands"
-        run: sfdx config:set defaultusername=${{secrets.PRODUCTION_USERNAME}} defaultdevhubusername=${{secrets.PRODUCTION_USERNAME}}
+        run: sfdx config:set defaultusername=${{secrets.PRODD_SFDX_USER}} defaultdevhubusername=${{secrets.PRODD_SFDX_USER}}
 
       # Create/deploy release artifact to production org
+
+      # Set build name from data for release artifact
+      - name: Get date for build name
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+
+      - name: Test with environment variables
+        run: echo $RELEASE_NAME
+        env:
+          RELEASE_NAME: release-artifact-${{ steps.date.outputs.date }}
+
+      # Store branch ids for reference
+      - name: Get branch refs
+        run: |
+          echo "HEAD_REF=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+          echo "BASE_REF=$(echo ${GITHUB_BASE_REF} | tr / -)" >> $GITHUB_ENV
+
+      # Install SFDX & SFDX Git Delta
+      - name: Install SFDX Git Delta
+        run: |
+          echo y | ~/sfdx-cli/bin/run plugins:install sfdx-git-delta
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --all
+          git --no-pager diff --name-status origin/${{ env.BASE_REF }}^ origin/${{ env.HEAD_REF }}
 
       # Convert source code to metadata
       - name: Convert source code to metadata format
         run: sfdx force:source:convert --rootdir force-app --outputdir source_convert
+
+      # Generate manifest
+      - name: Generate destructive changes metadeta
+        run: |
+          sfdx sgd:source:delta --to origin/${{ env.HEAD_REF }} --from origin/${{ env.BASE_REF }}^ --output .
+          echo
+          echo "--- package.xml generated with added and modified metadata ---"
+          cat package/package.xml
+          echo
+          echo
+          echo
+          echo "-- destructiveChanges.xml ---"
+          cat destructiveChanges/destructiveChanges.xml
+          echo
+          echo
+          echo
+          echo "--- destructiveChanges/package.xml ---"
+          cat destructiveChanges/package.xml
+
+      # Copy changes to release artifact
+      - name: Append destructive changes to source metadata
+        run: cp destructiveChanges/destructiveChanges.xml source_convert
 
       # Create release artifact
       - name: Create release artifact
@@ -76,6 +124,6 @@ jobs:
       - name: Remove source convert output directory
         run: rm -r source_convert
 
-      # Test and deploy artifact
-      - name: Test artifact deployment to production org
+      # Validate and deploy
+      - name: Deploy artifact to production org
         run: sfdx force:mdapi:deploy --zipfile release-artifact-${{steps.date.outputs.date}}.zip --testlevel RunAllTestsInOrg -w 10
